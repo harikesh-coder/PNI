@@ -1,0 +1,581 @@
+#include <errno.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <starlet>
+
+#include "ngend_vms.h"
+#include "ngend_vms_string.h"
+#include "ngend_vms_time.h"
+#include "ngend_vms_file.h"
+#include "ngend_vms_lock.h"
+#include "ngend_vms_event.h"
+#include "ngend_vms_impersonate.h"
+#include "nipsd_manager.h"
+#include "nipsd_config.h"
+#include "nipsd_session_control.h"
+#include "ngend_tcp_simpleprotocol.h"
+
+
+static NodeName_T      curNode;
+static NodeName_T      curUser;
+static char            jobLnmTable[256];
+static UWord_T         jobLnmTableLen;
+//convert into c++ 
+static char * environmentName = "DEFAULT";  
+
+static char * getOutputFileName (char * node)
+{
+  static FileName_T cf;
+  NodeName_T cNode;
+  char date[20];
+  char time[20];
+  VmsTime_T   tim;
+  
+  tim = GetTime();
+   
+  Gen_Utl_Get_SystemName(cNode);
+
+  Gen_Utl_Fmt_SimpleFormat_Time(&tim, "%Y%M%d", date, sizeof(date)); 
+  Gen_Utl_Fmt_SimpleFormat_Time(&tim, "%h%m%s", time, sizeof(time)); 
+   
+  strcpy(cf , detachedLogFile);
+  Gen_Utl_Rpl_String(cf, sizeof(FileName_T)-1, NULL, "%I", environmentName);
+  Gen_Utl_Rpl_String(cf, sizeof(cf), NULL, "%D", date);
+  Gen_Utl_Rpl_String(cf, sizeof(cf), NULL, "%T", time);
+  Gen_Utl_Rpl_String(cf, sizeof(cf), NULL, "%N", node);
+  return cf;
+}
+static char * getCommandFileName (char * node)
+{
+  static FileName_T cf;
+  NodeName_T cNode;
+  char date[20];
+  char time[20];
+  VmsTime_T   tim;
+  
+  tim = GetTime();
+   
+  Gen_Utl_Get_SystemName(cNode);
+
+  Gen_Utl_Fmt_SimpleFormat_Time(&tim, "%Y%M%d", date, sizeof(date)); 
+  Gen_Utl_Fmt_SimpleFormat_Time(&tim, "%h%m%s", time, sizeof(time)); 
+   
+  strcpy(cf , detachedComFile);
+  Gen_Utl_Rpl_String(cf, sizeof(FileName_T)-1, NULL, "%I", environmentName);
+  Gen_Utl_Rpl_String(cf, sizeof(cf), NULL, "%D", date);
+  Gen_Utl_Rpl_String(cf, sizeof(cf), NULL, "%T", time);
+  Gen_Utl_Rpl_String(cf, sizeof(cf), NULL, "%N", node);
+  return cf;
+}
+
+static char * getProcessName (char * node)
+{
+  static char cf[32];
+  char cf2[32];
+  NodeName_T cNode;
+  char date[20];
+  char time[20];
+  VmsTime_T   tim;
+  
+  tim = GetTime();
+   
+  Gen_Utl_Get_SystemName(cNode);
+   
+  strcpy(cf , detachedProcessName);
+  Gen_Utl_Rpl_String(cf, sizeof(cf)-1, NULL, "%I", environmentName);
+  Gen_Utl_Rpl_String(cf, sizeof(cf), NULL, "%N", node);
+  if (strlen(cf) > 15)
+  {
+     strcpy(cf2, cf);
+     Gen_Utl_Rpl_String(cf, sizeof(cf)-1, NULL, "_", "");
+     printf("Process name is too long (max 15 char): - shortened from \"%s\" to \"%s\"\n",
+             cf2, cf
+     
+     );
+  }
+  return cf;
+}
+
+static void showUsage(char * msg, char * p0)
+{
+    if (msg) printf("%s\n\n\n", msg);
+    printf ("  usage: %s <RESTART|STOP|ABORT> environment <Instance> <<Node>|* - default is current node>\n", p0);
+    printf ("     Instance:   The name of the IPServer Instance <NodeName>_<PortNumber> or n");
+    printf ("                \"*\" for all instances\n");
+    printf("     \"STOP\"    : Stops the specified server at a qiuiet point\n");
+    printf("     \"ABORT\"   : Stops the specified server immediatatleyy terminates the exec threads\n");
+    printf("     \"RESTART\" : Restarts the specified server(s) at a quite point - this does not stop the server process \n");
+    printf("   or \n");
+    printf("       %s START  <<ConfigFile> | env <instance>> [<node>]\n", p0);
+    printf("     \"START\"   : Starts a specified server with a configuration file  \n");
+    printf("     \"SHOW SESSIONS  <ConfigFile> | env <instance>>\"   : Shows the current active sessions  \n");
+}
+
+static void HandleTimeOut(void * dummy)
+{
+    printf ("Request is timed out ... 1 (or more) server(s) do not respond in time to notification !\n");
+    exit(SS$_TIMEOUT);
+}
+
+
+
+static void HandlePing (char * configurationFile, char * host)
+{
+
+   StringBuffer_T            buf;
+   TcpSimpleMessageContext_T sendCtx;
+   TcpSimpleMessageContext_T sendCtx2;
+   TcpSimpleMessageContext_T receiveCtx;
+   FileName_T                cnfFileParsed;    
+ 
+   if (configurationFile == NULL)
+   {
+      strcpy(cnfFileParsed, "IPSERVER_ROOT:[CONF]IPSERVER.CONF");
+   }
+   else
+     Gen_Utl_Parse_VmsFileName(cnfFileParsed, configurationFile,  "IPSERVER_ROOT:[CONF].CONF", TRUE );  
+
+   if (! LoadIPSServerConfiguration(cnfFileParsed))
+   {
+          printf("No configuration file found -  \"%s\" is missing \n", configurationFile);
+          exit(1);  
+   }  
+ 
+   TcpSocket_T socket;
+   int sts;
+   socket = NULL;
+   sts = Tcp_Utl_Hnd_Connect_Socket	 (&socket,  TcpServerPort, host   );
+   if (sts < 0)
+   {
+     Tcp_Utl_Get_Last_Status (socket, NULL, &sts);   
+     exit(sts);
+   } 
+   
+   buf = CreateStringBuffer(255, 1000);
+
+   
+   sendCtx = NewSimpleMessageContext(socket, NORMAL, PLAIN);
+   sendCtx2 = NewSimpleMessageContext(socket, NORMAL, PLAIN);
+   writeMessageString(sendCtx, "PING");
+   receiveCtx =  ReceiveSimpleMessageContext( socket );
+   buf->truncate(buf,0);
+   readMessageData(receiveCtx,  buf ); 
+   printf("%s\n", buf->value);
+   writeMessageString(sendCtx2, "<EOJ>");
+   
+   DestroySimpleMessageContext( &sendCtx);
+   DestroySimpleMessageContext( &sendCtx2);
+   DestroySimpleMessageContext( &receiveCtx);
+   Tcp_Utl_Hnd_Delete_Socket(&socket, DISCARD_ALL_PACKAGES_ON_DELETE , FALSE);
+
+}
+
+static void HandlePingDirect (char * host, int port)
+{
+
+   StringBuffer_T            buf;
+   TcpSimpleMessageContext_T sendCtx;
+   TcpSimpleMessageContext_T sendCtx2;
+   TcpSimpleMessageContext_T receiveCtx;
+   FileName_T                cnfFileParsed;    
+ 
+ 
+   TcpSocket_T socket;
+   int sts;
+   socket = NULL;
+   sts = Tcp_Utl_Hnd_Connect_Socket	 (&socket,  port, host   );
+   if (sts < 0)
+   {
+     Tcp_Utl_Get_Last_Status (socket, NULL, &sts);   
+     exit(sts);
+   } 
+   
+   buf = CreateStringBuffer(255, 1000);
+
+   
+   sendCtx = NewSimpleMessageContext(socket, NORMAL, PLAIN);
+   sendCtx2 = NewSimpleMessageContext(socket, NORMAL, PLAIN);
+   writeMessageString(sendCtx, "PING");
+   receiveCtx =  ReceiveSimpleMessageContext( socket );
+   buf->truncate(buf,0);
+   readMessageData(receiveCtx,  buf ); 
+   printf("%s\n", buf->value);
+   writeMessageString(sendCtx2, "<EOJ>");
+   
+   DestroySimpleMessageContext( &sendCtx);
+   DestroySimpleMessageContext( &sendCtx2);
+   DestroySimpleMessageContext( &receiveCtx);
+   Tcp_Utl_Hnd_Delete_Socket(&socket, DISCARD_ALL_PACKAGES_ON_DELETE , FALSE);
+
+}
+
+static  char * startCommandFormat = "RUN SYS$SYSTEM:LOGINOUT.EXE" \
+                       "/DETACH" \
+                       "/INPUT=%s"  \
+                       "/OUTPUT=%s" \
+                       "/PROCESS_NAME=\"%s\"" \
+                       "%s";
+static  char * startCommandFormatRemote = "RUN SYS$SYSTEM:LOGINOUT.EXE" \
+                       "/DETACH" \
+                       "/INPUT=%s"  \
+                       "/OUTPUT=%s" \
+                       "/PROCESS_NAME=\"%s\"" \
+                       "/ON=%s" \
+                       "%s";
+
+static int  startServer( char * configurationFile, char * node)
+{
+   FILE * cmdFile;
+   Status_T sts = 1;
+   ProcessNameT  prcName;
+   NodeName_T    targetNode;
+   FileName_T    comFile;
+   FileName_T    outFile;
+   FileName_T    outFileParsed;
+   FileName_T    comFileParsed;
+   FileName_T    cnfFileParsed;
+   FileName_T    sesFileParsed;
+   Boolean_T     localCommand;     
+   char startCommand [1025];
+   FileName_T    scratchDir = "SYS$SCRATCH:";
+
+   if (configurationFile == NULL)
+   {
+      strcpy(cnfFileParsed, "IPSERVER_ROOT:[CONF]IPSERVER.CONF");
+   }
+   else
+     Gen_Utl_Parse_VmsFileName(cnfFileParsed, configurationFile,  "IPSERVER_ROOT:[CONF].CONF", TRUE );  
+
+   if (! LoadIPSServerConfiguration(cnfFileParsed))
+   {
+          printf("No configuration file found -  \"%s\" is missing \n", configurationFile);
+          return  2;  
+   }  
+   strcpy(targetNode, curNode);
+   if (node != NULL)
+   {
+      if (strlen(node) > 0)
+      {
+         strcpy(targetNode, node);
+         strToUpper(targetNode);
+
+      }
+   }
+   localCommand =   streqlcaseless(targetNode,curNode) ;
+   char pniVersion[1025];
+   UWord_T pniVersionLength;
+   memset(pniVersion, '\0', sizeof(pniVersion));
+   Boolean_T currentUser = FALSE;
+   
+   if (RunAsRIDebugAgent)
+    {
+       strcpy(targetNode, curNode);
+       printf("Server will  run for ACMS debug on local node\n");
+       localCommand = TRUE;
+       sts = Gen_Utl_Get_Logical("PNI$VERSION", NULL,pniVersion, sizeof(pniVersion) - 1, &pniVersionLength, 0);
+       if (sts < -1)
+       {
+         printf ("PNI$VERSION logical name is not defined ! \n");
+         exit(2);
+       }
+       sts = Gen_Utl_Get_Logical("LNM$JOB", "LNM$PROCESS_DIRECTORY", jobLnmTable, sizeof(jobLnmTable) - 1, &jobLnmTableLen, 0);
+       if (sts < -1)
+       {
+         printf ("LNM$JOB logical name is not defined ! \n");
+         exit(2);
+       }
+    }
+    else
+    {
+        Gen_Utl_Set_Logical("LNM$PROCESS", "LNM$PROCESS_DIRECTORY",
+           "MODE=USER","STRINGLIST", logicalNameTables,
+                       "STRING", "LNM$PROCESS_TABLE" 
+                        );
+    
+    }
+    
+    ImpersonateHndlT  hndl;
+    strcpy(outFile, getOutputFileName (targetNode));
+      
+        
+  
+    strcpy(comFile, getCommandFileName (targetNode));
+    
+        
+        
+       Gen_Utl_Parse_VmsFileName(outFileParsed, outFile, NULL, True );  
+       Gen_Utl_Parse_VmsFileName(sesFileParsed, "IPSERVER$SESSION_CONTROL_FILE", NULL, True );  
+       Gen_Utl_Parse_VmsFileName(comFileParsed, comFile, NULL, True );  
+       outFileParsed[strcspn(outFileParsed, ";")] = '\0';
+       comFileParsed[strcspn(comFileParsed, ";")] = '\0';
+       sesFileParsed[strcspn(sesFileParsed, ";")] = '\0';
+
+       cmdFile = fopen(comFileParsed, "w"); 
+       if ( cmdFile == NULL)
+       {
+           printf("Cannot open %s\n", comFileParsed);
+           return 2;
+       }
+
+       if (RunAsRIDebugAgent)
+       {
+          fprintf(cmdFile, "$ @pni$tools:pni$multi_connect %s\n", pniVersion);
+          fprintf(cmdFile, "$!  @IPSERVER_ROOT:[EXE]CONNECT_LNMTABLE \"%s\"\n", jobLnmTable);
+          fprintf(cmdFile, "$ lnmj = F$trnlnm(\"LNM$JOB\", \"LNM$PROCESS_DIRECTORY\") \n");
+          fprintf(cmdFile, "$ define/table=LNM$PROCESS_DIRECTORY LNM$JOB 'lnmj',%s \n", jobLnmTable     );
+      //   printf("Adding JOB logical name table job %s to list \n", jobLnmTable);
+          fprintf(cmdFile, "$  rimage := $IPSERVER_ROOT:[EXE]NIPSP_SERVER.EXE_RI_DEBUG\n");
+          fprintf(cmdFile, "$  define ACMS$DEBUG_AGENT_TASK Y\n");
+          fprintf(cmdFile, "$ !\n");
+       }
+       else
+       {
+         fprintf(cmdFile, "$  @IPSERVER_ROOT:[EXE]CONNECT_LNMTABLE \"%s\"\n", logicalNameTables);
+         fprintf(cmdFile, "$ !\n");
+         fprintf(cmdFile, "$  define/system/nolog IPSSERVER$ENV_CONFILE_%s \"%s\"\n",environmentName, cnfFileParsed );
+         fprintf(cmdFile, "$  define/system/nolog IPSSERVER$ENV_SESSIONFILE_%s \"%s\"\n",environmentName, sesFileParsed );
+         fprintf(cmdFile, "$  rimage := $IPSERVER_ROOT:[EXE]NIPSP_SERVER.EXE\n");
+         fprintf(cmdFile, "$  rmimage := $IPSERVER_ROOT:[EXE]NIPSP_MANAGER.EXE\n");
+         fprintf(cmdFile, "$  define decc$fd_locking true\n");
+         fprintf(cmdFile, "$ !\n");
+         if (dedicatedCPU >= 0)
+         {
+           fprintf(cmdFile, "$ set noon\n");
+           fprintf(cmdFile, "$ set process/affinity/set=%d/permanent\n", dedicatedCPU);
+           fprintf(cmdFile, "$ set on\n");
+         }
+         fprintf(cmdFile, "$ !\n");
+
+         fprintf(cmdFile, "$  set process/dump\n");
+         fprintf(cmdFile, "$ !\n");
+       }
+    //   fprintf(cmdFile, "$restart:\n");
+       fprintf(cmdFile, "$  rimage %s\n", cnfFileParsed);
+       fprintf(cmdFile, "$  sts = '$status .and. .not. %%X10000000 \n");
+       fprintf(cmdFile, "$  show process/acc\n");
+       fprintf(cmdFile, "$  if (sts .eq. 5)\n");
+       fprintf(cmdFile, "$  then\n");
+       fprintf(cmdFile, "$     rmimage start env %s \n", environmentName);
+       fprintf(cmdFile, "$  endif\n");
+       fprintf(cmdFile, "$  set noon\n");
+       fprintf(cmdFile, "$  delete/ignore=interlock 'f$envir(\"PROCEDURE\");\n");
+       fprintf(cmdFile, "$  exit\n"); 
+       fclose(cmdFile);
+   
+        
+       strcpy(prcName, getProcessName (targetNode));
+
+ 
+
+       if (!RunAsRIDebugAgent)
+       {
+         sts = CreateVmsImpersonate(runUserName, &hndl);
+         if (EVEN(sts)) printf("Status Impersonate: %d - cannot impersonate user \"%s\"  - start command might fail \n", sts, runUserName);          
+        
+         VmsImpersonate(hndl);
+       }
+       if (localCommand)
+          sprintf(startCommand, startCommandFormat, comFileParsed,  outFileParsed, prcName, detachedProcessQualifiers);
+        else
+         sprintf(startCommand, startCommandFormatRemote, comFileParsed,  outFileParsed, prcName, targetNode, detachedProcessQualifiers);
+        
+        printf ("Running:\n%s\n", startCommand);
+        sts = Gen_Exe_Dcl_Commands(startCommand, NULL);        
+        if (EVEN(sts)) printf("Status of lib$spawn: %d\n", sts);          
+        if (!RunAsRIDebugAgent) DestroyVmsImpersonate(&hndl);
+      
+      return sts;
+}
+int NISPP_MANAGER ( int argc , char * args[]  ) MAIN_PROGRAM
+{
+    
+    VmsTime_T timeOut ;   
+    UInteger_T  reqid;
+    char viperAccount[20] ="";
+    VmsTime_T collectionTime ;   
+    Status_T sts;
+    IPSEventType event = IPSEVENT_NONE; 
+    UInteger_T serverLock;
+    UInteger_T currentID;
+    UWord_T retL;
+    ManagerEventMessageT msg;
+    FileName_T   confFile;
+    
+    char * p1;
+    
+    char * p2;
+    if (argc < 3)
+    {
+       showUsage("Insufficient parameters !", args[0]);
+       exit(2);
+    }  
+    
+    p1 = strdup(args[1]);
+    p2 = strdup(args[2]);
+   
+    strToUpper(p1);
+    strToUpper(p2);
+ 
+    Gen_Utl_Get_SystemName(curNode);
+       
+    if (strcmp(p1, "STOP") == 0)            event = IPSEVENT_STOP; 
+    else  if (strcmp(p1, "ABORT") == 0)     event = IPSEVENT_STOPABORT; 
+    else  if (strcmp(p1, "RESTART") == 0)   event = IPSEVENT_RESTART; 
+    else  if (strcmp(p1, "START") == 0)     event = IPSEVENT_START; 
+    else  if (strcmp(p1, "PING") == 0)      event = IPSEVENT_PING; 
+    else  if (strcmp(p1, "FORCEDUMP") == 0) event = IPSEVENT_FORCE_PROCESS_DUMP;
+
+    if (strcmp(p1, "SHOW") == 0 )
+    {
+        if (memcmp(p2, "SESS", 4) == 0)
+        {
+           if (argc < 4)
+           {
+              showUsage("Insufficient parameters !", args[0]);
+              exit(2);              
+           }
+           char * p3 = strdup(args[3]);
+           strToUpper(p3);
+           if ((strcmp(p3, "ENV") == 0) || (strcmp(p3, "ENVIRONMENT") == 0))
+           {
+              if (argc < 5)
+              {
+                showUsage("Insufficient parameters !", args[0]);
+                exit(2);              
+              }
+// TO DO - get the SESSION CONTROL file logical name value from the configuation logical name table
+              sprintf(confFile, "IPSSERVER$ENV_SESSIONFILE_%s", args[4]);   
+              ShowIpsServerSessions (confFile);     
+           }
+          else
+               ShowIpsServerSessions (args[3]);      
+        }
+        return 1;
+    }
+ 
+    char * nodePtr = NULL;
+    if (event == IPSEVENT_START)
+    {
+       if (argc < 3)
+       {
+       
+          showUsage("Insufficient parameters !", args[0]);
+          exit(2);
+       } 
+       strcpy(confFile, p2); 
+       if ((strcmp(p2, "ENV") == 0) || (strcmp(p2, "ENVIRONMENT") == 0))
+       {
+           if (argc < 4)
+           {
+              showUsage("Insufficient parameters !", args[0]);
+              exit(2);              
+           }
+           sprintf(confFile, "IPSERVER_ROOT:[CONF]IPSERVER_%s.CONF", args[3]);       
+           if (argc > 4) nodePtr = args[4];
+       }
+       else
+       {
+            if (argc > 3) nodePtr = args[3];
+       }      
+       return startServer(confFile, nodePtr);
+    }
+    
+    if  (event == IPSEVENT_PING)
+    {
+     
+       if (argc < 4)
+       {
+       
+          showUsage("Insufficient parameters !", args[0]);
+          exit(2);
+       } 
+       strcpy(confFile, p2); 
+       if ((strcmp(p2, "ENV") == 0) || (strcmp(p2, "ENVIRONMENT") == 0))
+       {
+           if (argc < 5)
+           {
+              showUsage("Insufficient parameters !", args[0]);
+              exit(2);              
+           }
+           sprintf(confFile, "IPSERVER_ROOT:[CONF]IPSERVER_%s.CONF", args[3]);       
+           nodePtr = args[4];
+           HandlePing (confFile, nodePtr);
+       }
+       else  if (strcmp(p2, "NODE") == 0)
+       {
+           if (argc < 5)
+           {
+              showUsage("Insufficient parameters !", args[0]);
+              exit(2);       
+           }          
+           nodePtr = args[3];
+           int port = atoi(args[4]);
+           HandlePingDirect ( nodePtr,  port);
+       }      
+       else
+       {
+              showUsage("Insufficient parameters !", args[0]);
+              exit(2);       
+       }          
+       
+     
+       
+      exit(1);   
+    }
+    if (event == IPSEVENT_NONE)
+    {
+       showUsage("Invalid syntax!", args[0]);
+       exit(2);               
+    }
+    
+    char messageId [15] = "*";
+    char extId [15] = "";
+    if ((strcmp(p2, "ENV") == 0) || (strcmp(p2, "ENVIRONMENT") == 0))
+    {
+        if (argc < 4)
+        {
+              showUsage("Insufficient parameters !", args[0]);
+              exit(2);              
+        }
+        nodePtr = curNode;  
+        if (argc > 4)
+        { 
+          sprintf(extId, "%s_%s", args[3], args[4]);   // environ + "_" + node""          
+          sprintf(messageId, "%s_%s", args[4], args[3]);   // Node + "_" + environ""
+        }
+        else
+        {
+          sprintf(extId, "%s_%s", args[3], curNode);             
+          sprintf(messageId, "%s_%s", curNode, args[3]);       
+        }
+        strToUpper(messageId);
+        strToUpper(extId);
+     }
+    else
+    {
+        showUsage("Invalid syntax!", args[0]);
+        exit(2);              
+    }      
+    
+    memset(&msg, '\0', sizeof( ManagerEventMessageT));
+    msg.event = (unsigned char) event;
+    strncpy(msg.id, messageId, sizeof(msg.id) - 1);
+
+    timeOut.INT = - VMSTIME_xSECOND(30);
+    Gen_Utl_DeclareTimer(EFN$C_ENF, timeOut, HandleTimeOut, NULL, False, &reqid);
+
+    if (strstr(messageId, "*"))
+     Gen_Utl_Signal_Event (MANAGER_EVENT , (char *) &msg, NULL);
+    else
+    {
+        char s[512];
+        sprintf(s, "%s_%s",  MANAGER_EVENT , extId);
+        Gen_Utl_Signal_Event (s , (char *) &msg, NULL);
+     
+    }
+
+    return 1;
+}
+
+                                                                 

@@ -1,0 +1,1618 @@
+#include  <ssdef.h>
+#include  <errno.h>
+#include  <stdlib.h>
+#include  <stdio.h>
+#include  <string.h>
+#include  <pthread.h>
+#include  <pthread_exception.h>
+#include "lib$routines.h"
+#include "ngend_vms_errorhandlers.h"
+
+
+#include "ngend_global_types.h"
+#include "ngend_vms.h"
+#include "ngend_vms_descrip.h"
+#include "ngend_vms_string.h"
+#include "ngend_vms_event.h"
+#include "ngend_vms_file.h"
+#include "ngend_vms_lock.h"
+#include "ngend_vms_time.h"
+#include "ngend_vms_interlockedqueue.h"
+#include "ngend_slotpool_manager.h"
+
+#include "nipsd_config.h"
+#include "ngend_tcp_routines.h"
+#include "ngend_tcp_simpleprotocol.h"
+
+#include "nipsd_acms_task.h"
+#include "nipsd_messages.h"
+#include "nipsd_acms_agent.h"
+#include "ngend_stringbuffer.h"
+#include "nipsd_session_control.h"
+#include "nlgrd_client.h"
+#include "nipsd_manager.h"
+#include "nipsd_loadbalancer_communication.h"
+#include "nipsd_load_datahandler.h"
+#include "nipsd_state_manager.h"
+#include "nipsd_intraserver_communication.h"
+#define  TCPIP_IO_BUFFER_SIZE 4092
+#define  NOT_ENOUGH_MEMORY SS$_INSFMEM 
+
+static  const char * restartCommandFormat = "mc IPSERVER_ROOT:[EXE]NIPSP_MANAGER START ENV %s" ;
+
+
+static   char serverId [15];
+static   char location[256];
+static   char message[256];
+static   IPSEventType globalEvent = IPSEVENT_NONE;
+static   UInteger_T   serverLock;
+static   UInteger_T   nullTaskId [] = {0,0,0,0}; 
+static   SlotPoolManagerT serverSlots;
+static void          closeTCPIPProperly();
+static Status_T      ManageServer();
+static Status_T      ManageSpecificServer();
+static Status_T      SetTracing();
+static TcpSocket_T   sockPassive	= NULL;
+static  char *       MainExecutablePath ;
+
+static pthread_mutex_t      activeCounterMutex =   PTHREAD_MUTEX_INITIALIZER;
+
+
+extern Boolean_T    LgrErrorForwardCockpitFallback;
+
+#define ERROR_MESSAGE_FORMAT "01 SYSER|%d| ACMS Error %d"
+#define ERROR_SESSION_MESSAGE_FORMAT "01 SYSER|%d| Session not valid -  maybe expired - relogin required"
+#define INVALID_TASK_MESSAGE_FORMAT  "01 SYSER|%d| Invalid task message received "
+
+typedef struct
+{
+
+   VmsTime_T acceptTime;
+   VmsTime_T startTime;
+   VmsTime_T endTime;
+   VmsTime_T readStartTime;
+   VmsTime_T readEndTime;
+   VmsTime_T acmsStartTime;
+   VmsTime_T acmsEndTime;
+   VmsTime_T tracStartTime;
+   VmsTime_T tracEndTime;
+   VmsTime_T statStartTime;
+   VmsTime_T statEndTime;
+   VmsTime_T povStartTime;
+   VmsTime_T povEndTime;
+   VmsTime_T sndStartTime;
+   VmsTime_T sndEndTime;
+   VmsTime_T serStartTime;
+   VmsTime_T serEndTime; 
+   VmsTime_T dserStartTime;
+   VmsTime_T dserEndTime; 
+}  ProcessingTimeStampsT;
+
+typedef  struct
+{
+    pthread_t       workerThread;
+    TcpSocket_T	    workerSocket;
+    char            ThreadId[52];
+    //int             bufferSize;
+    //char        *   buffer;
+    int             stateSlot;
+    int             serverSlot;
+    UInteger_T      keepAliveTimerId;
+    ProcessingTimeStampsT tStamps;
+	ACMSTaskT       task   ;
+    StringBuffer_T  buffer;
+
+}  RequestCtxT;
+
+static RequestCtxT ** serverActiveEntries = NULL;
+
+typedef  void * (* VoidFunction_T) (void *);
+
+static pthread_t ThreadDebug;
+
+static    TcpHostName_T     localHost;
+static    EventHndl_T       managerSpecificEvent = NULL;
+static    EventHndl_T       managerEvent = NULL;
+static    EventHndl_T       traceEvent = NULL;
+static    NodeName_T        currentNodeName;
+static    pthread_attr_t    stackAttr;
+static    pthread_attr_t    stackHandlerAttr;
+static    int               currentThreadsActive = 0;
+static    pthread_t		      handlerThread;
+
+//* ICC handler thread 
+
+
+typedef struct 
+{
+    Identifier_T node;
+    Identifier_T ID;
+    char msg [2048];
+ } IntraCommHandlerMessageT;
+
+
+static UInteger_T            iccQueueEventFlag = 0;
+static InterlockedQueueT     iccQueue = NULL;
+static Boolean_T             iccQueueActive = FALSE;
+static pthread_t		         iccHandlerThread = NULL;
+//END
+
+#define CVTCOBOLCSTRING(x)  cvtCobolToTrimmedCString(x, sizeof(x))
+
+static char * cvtCobolToTrimmedCString(char * src, int cobolLength)
+{
+   char * rs;
+   rs = calloc(1, cobolLength + 1);
+   memcpy(rs, src, cobolLength);
+   for (int i=cobolLength-1; i >= 0; i--)
+      if ((rs[i] == ' ') || (rs[i] == '\0')) rs[i] = '\0'; else break;
+   return rs;
+}
+static char * cvtCobolToTrimmedCStringNoalloc(char * src, int cobolLength)
+{
+   char * rs;
+   rs = src;
+   memcpy(rs, src, cobolLength);
+   for (int i=cobolLength-1; i >= 0; i--)
+      if ((rs[i] == ' ') || (rs[i] == '\0')) rs[i] = '\0'; else break;
+   return rs;
+}
+
+static int fatalErrorSequence = 0;
+
+
+static inline int difTimeMS(VmsTime_T *t0, VmsTime_T * t1)
+{
+    VmsTime_T t;
+    t.INT = t1->UINT - t0->UINT;
+    return t.INT / VMSTIME_1MILLISECOND;
+}
+static inline Int64 cvtTimeMS(VmsTime_T *t0)
+{
+    return t0->UINT / VMSTIME_1MILLISECOND;
+}
+static inline Int64 cvtTimeMSOffset(VmsTime_T *tOffset, VmsTime_T *t0)
+{
+    VmsTime_T t;
+    t.INT = tOffset->UINT - t0->UINT;
+    return  t.UINT/ VMSTIME_1MILLISECOND;
+}
+
+
+static void * handleIccMessages(void * arg);
+// ICC Init 
+static void InitializeIccMessageProcessing()
+{
+   int sts;
+   if (!Gen_Utl_GetLocalEventFlag(&iccQueueEventFlag))
+   {
+      printf("Cannot assign local event flag for ICC Message Handler\n");
+      sys$exit(2);
+   }
+   Gen_Utl_ClearLocalEventFlag(iccQueueEventFlag);
+   
+//void Gen_Utl_WaitLocalEventFlag(UInteger_T evtFlag);
+//void Gen_Utl_SetLocalEventFlag(UInteger_T evtFlag);
+//void Gen_Utl_FreeLocalEventFlag(UInteger_T * evtFlag);
+//Boolean_T Gen_Utl_ClearLocalEventFlag(UInteger_T evtFlag);
+  sts = NewInterlockedQueue("IPS_ICC", &iccQueue,   QUEUE_TAIL, QUEUE_HEAD);
+  if (EVEN(sts))
+  {
+      printf("Cannot create processing queue for ICC message handler : status %d\n", sts);
+      sys$exit(sts);
+  }
+  
+  iccQueueActive = TRUE;
+  sts = pthread_create (&iccHandlerThread,  &stackAttr,	( VoidFunction_T )  handleIccMessages, NULL);
+  if (sts)
+  {
+     printf("Cannot create processing queue for ICC message handler : thread status %d\n", sts);
+     sys$exit(2);  
+  } 
+
+}
+
+static void StopIccMessageProcessing()
+{
+    iccQueueActive = FALSE; 
+    Gen_Utl_SetLocalEventFlag(iccQueueEventFlag);
+}
+static void InitializeServer()
+{
+    UWord_T   retLen ;
+    char    * buffer;
+    Status_T  sts;
+    
+    SetTcpipMessageBufferSize(TcpIpBufferSize);
+    sts = Tcp_Utl_Hnd_Get_Local_Host (localHost);
+    pthread_attr_init(&stackAttr);
+    pthread_attr_init(&stackHandlerAttr);
+    sts = pthread_attr_setstacksize(&stackAttr,  ExecutorThreadStackSize * 1024);
+    sts = pthread_attr_setguardsize(&stackAttr, 2048);
+    sts = pthread_attr_setstacksize(&stackHandlerAttr,  32 * 1024);
+    sts = pthread_attr_setguardsize(&stackHandlerAttr, 2048);
+    InitializeStateHandler(30, getStateSessionName(),getStateSessionFileName (), TRUE);
+
+    serverSlots = CreateSlotPool(ExecutorThreadsMaxActive);
+    serverActiveEntries = calloc(ExecutorThreadsMaxActive, sizeof(RequestCtxT * ));
+    pthread_mutex_init (&activeCounterMutex, NULL);
+    InitializeIccMessageProcessing();
+
+}
+
+static void thread_delay (int secs)
+{
+  struct timespec interval = {secs, 0};
+  pthread_delay_np (&interval);
+}
+
+static Boolean_T waitForCompletion(int maxActiveThreads, int timeOut)
+{
+   int busyCnt = 0;
+   VmsTime_T stTime;
+   VmsTime_T eTime;
+   VmsTime_T dTime;
+   
+   stTime = GetTime();
+   do
+   {
+      busyCnt = 0;
+      for (int i=0; i < ExecutorThreadsMaxActive; i++)
+      {
+          busyCnt += (serverActiveEntries[i] == NULL) ? 0:1;
+      }
+      if (busyCnt <= maxActiveThreads) break; 
+      if (timeOut != 0) thread_delay(1); 
+         //Gen_Utl_Wait(1.0);  Replaced with thread_delay as there is problem
+      if (timeOut > 0)
+      {
+         eTime = GetTime();
+         dTime.INT = eTime.UINT - stTime.UINT;
+         if (CnvToSecondsDbl(dTime) > timeOut) break;
+      }
+      printf ("%s, Waiting for completion for %d tasks\n", vmsasctime(NULL), busyCnt); 
+   }
+   while (busyCnt >= maxActiveThreads) ;
+   
+   return (busyCnt <= maxActiveThreads) ;
+}
+
+static int receiveMessage(TcpSocket_T sock, StringBuffer_T buf, Boolean_T * keepAliveSupport)
+{
+   TcpSimpleMessageContext_T  msg;
+   Status_T                   sts = 0;
+   VmsTime_T t0, t1, t2, t3; 
+   t0 =  GetTime();
+   msg =  ReceiveSimpleMessageContext(sock);
+   buf->truncate(buf, 0);
+   t1 =  GetTime();
+
+   if (msg == NULL) return NOT_ENOUGH_MEMORY; 
+   
+   t2 =  GetTime();         
+   if (msg->contextValid)
+   { 
+   sts = 0;
+      //while (readMessageDataHasMore(msg) && EVEN(sts))  
+      sts = readMessageData(msg, buf );
+   }
+
+   t3 = GetTime();
+  // printf("TT: %Ld %Ld\n", t1.UINT - t0.UINT, t3.UINT - t2.UINT);
+   if (keepAliveSupport) *keepAliveSupport = (msg->version > 1000);
+   DestroySimpleMessageContext(&msg);
+   return sts;                                 
+}
+
+
+static void * handleIccMessages(void * arg)
+{
+    ACMSSignInCtxtT  ctx;
+    char * tmp;
+    int cnt = 0;
+    int    tmpLen;
+    IntraCommHandlerMessageT * msg ;
+   
+    printf ("%s, ICC communication handler thread started ... \n", vmsasctime(NULL)); 
+    while (iccQueueActive )
+    {
+        Gen_Utl_WaitLocalEventFlag(iccQueueEventFlag);
+        Gen_Utl_ClearLocalEventFlag(iccQueueEventFlag);
+        if (!iccQueueActive)  break;
+        cnt = 0;
+        while (RemoveInterlockedQueue(iccQueue, (void **) &tmp, &tmpLen ) == 1)
+        {
+           if (tmpLen > 7)
+           {
+              msg = (IntraCommHandlerMessageT *) tmp;
+              if (memcmp(msg->msg, "LOGOFF ", 7) == 0)
+              {
+                 memset(&ctx, '\0', sizeof(ACMSSignInCtxtT));
+                 strncpy(ctx.userid, &msg->msg[7], sizeof(ctx.userid) - 1);
+                 printf("%s, Logoff received for user %s from IPS environment %s - %s\n", vmsasctime(NULL), ctx.userid, msg->node, msg->ID);
+ //       SignOutACMSnoWait(&ctx) ;
+                 SignOutACMS(&ctx, -1); //hangs in AST
+              }
+           } 
+           free(tmp);
+           if (((++cnt) % 3) == 0)   sched_yield();  // we yield aftre 3 msg processed
+        }
+    }
+    printf("%s, ICC communication handler thread exited ... \n", vmsasctime(NULL)); 
+    return NULL;
+}
+
+   
+
+
+static int  intraCommHandlerhandler(
+        UInteger_T          epid,
+        NodeName_T          node,
+        Identifier_T        ID,
+        Identifier_T        user,
+        char * inBuffer, UInteger_T inBufferLength,
+        char ** outBuffer, UInteger_T * outBufferLength   )
+{
+    // Handle the intra communication
+
+    *outBuffer = NULL;
+    *outBufferLength = 0;
+    
+    IntraCommHandlerMessageT  msg;
+    printf("Message received on IIC : %.*s\n", inBufferLength, inBuffer);  
+    memset (&msg, '\0', sizeof(IntraCommHandlerMessageT ));
+  
+    strncpy(msg.msg, inBuffer, MINIMUM(inBufferLength, sizeof(msg.msg) - 1));
+    strncpy(msg.node, node, sizeof(Identifier_T) - 1 );
+    strncpy(msg.ID, ID, sizeof(Identifier_T) - 1 );
+  
+    InsertInterlockedQueue(iccQueue, &msg, sizeof(msg));   // routine willl take care of the memory managment
+    Gen_Utl_SetLocalEventFlag(iccQueueEventFlag);
+    
+    return 0;
+}
+static char * formatOperationTime(VmsTime_T * tim, char * outBuf, int outBufLen)
+{
+    Gen_Utl_Fmt_SimpleFormat_Time(tim,"%Y%M%d%h%m%s%u",  outBuf, outBufLen);
+    return outBuf;
+}
+
+static int writeMessage(TcpSocket_T sock, char * buffer, int bufferLength)
+{
+    Status_T sts;
+    TcpSimpleMessageContext_T  msg;
+    msg =  NewSimpleMessageContext(sock , NORMAL,   PLAIN);
+    sts = writeMessageData(msg, buffer, bufferLength  );
+    DestroySimpleMessageContext(&msg);
+    return sts;
+}
+
+static char * kpAlineMessage = "--ACK--123456789012345678901234567890" ;
+static char dummybuff[10000];
+
+static void writeKeepAliveMessage( RequestCtxT * requestCtx )
+{
+    printf("Writing keepalive\n");
+    Status_T sts;
+    TcpSimpleMessageContext_T  msg;
+    msg =  NewSimpleMessageContext(requestCtx->workerSocket , NORMAL,   PLAIN);
+    sts = writeMessageData(msg, kpAlineMessage, strlen(kpAlineMessage)  );
+    DestroySimpleMessageContext(&msg);
+    printf("Reading keepalive in dummy buffer\n");
+    
+    Tcp_Utl_Hnd_ReadNoError_Socket (requestCtx->workerSocket, dummybuff, sizeof(dummybuff), NULL, 1);
+
+    return ;
+}
+
+static void cancelKeepAliveMessage( RequestCtxT * requestCtx )
+{
+    if (!keepTcpCommunicationAlive || (requestCtx->keepAliveTimerId == 0))  return;
+   Gen_Utl_CancelTimer( requestCtx->keepAliveTimerId);
+    requestCtx->keepAliveTimerId = 0;
+}
+
+static void scheduleKeepAliveMessage( RequestCtxT * requestCtx )
+{                
+    if (!keepTcpCommunicationAlive)  return;
+    VmsTime_T runSchedule;
+    Status_T sts;
+    runSchedule.INT = - VMSTIME_xSECOND(20);
+    Gen_Utl_DeclareTimer(EFN$C_ENF, runSchedule, ( AstRoutine_T )writeKeepAliveMessage, requestCtx, TRUE, &requestCtx-> keepAliveTimerId);
+    
+}
+
+static void delayCloseIPShutdown(  )
+{         
+           
+    static  UInteger_T        timerId;
+    static VmsTime_T runTime;
+    Status_T sts;
+    runTime.INT = - VMSTIME_1SECOND * PingServerInterval * 1.5;
+    Gen_Utl_DeclareTimer(EFN$C_ENF, runTime, ( AstRoutine_T ) closeTCPIPProperly, NULL, FALSE, &timerId);
+    
+}
+/*
+{
+    Status_T sts;
+    TcpSimpleMessageContext_T  msg;
+    msg =  NewSimpleMessageContext(sock , NORMAL,   PLAIN);
+    sts = writeMessageData(msg, buffer, bufferLength  );
+    DestroySimpleMessageContext(&msg);
+    return sts;
+}
+*/
+static void waitForClose(TcpSocket_T sock )    
+{
+   char buffer[255];
+
+   Tcp_Utl_Hnd_ReadNoError_Socket (sock, dummybuff, sizeof(dummybuff), NULL, maximumWaitTimeGUIClose);
+  // StopLoadBalancerConnection();
+   
+}  
+ 
+
+
+//void ACMSPERF$INITIALIZE(char *);
+//void ACMSPERF$LOG_ONE_TASK(char *, VmsTime_T *, VmsTime_T *, char *);
+
+//static void InitACMSPerformanceMonitoring()
+//{
+//    if (!ACMSPerformanceMonitoring) return;
+//    ACMSPERF$INITIALIZE("");
+//    
+//  
+//}
+
+static Boolean_T firstTimeStamp = TRUE;
+
+static void DoTimeStampLog(UInteger_T taskId[], char * taskName, 
+ char * operId, Boolean_T includeHeader,  ProcessingTimeStampsT * t,
+ char * remoteHost, UWord_T remotePort)
+{
+   char tim[24];
+   StringBuffer_T msgBuf = CreateStringBuffer(4048, 1000);
+ 
+   Gen_Utl_Fmt_SimpleFormat_Time(&t->startTime, "%Y-%M-%d %h:%m:%s.%u", tim, 24);
+  
+   msgBuf->appendFormat(msgBuf, "%s:%d-%s - %8.8x-%8.8x-%8.8x-%8.8x %s: %s ", 
+   remoteHost, remotePort, 
+   operId, taskId[0], taskId[1],taskId[2],taskId[3], taskName, tim );
+     
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "IP Accept Time", cvtTimeMS(&t->acceptTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld",  cvtTimeMS(&t->acceptTime));
+     
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Started", cvtTimeMS(&t->startTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld",  cvtTimeMS(&t->startTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Read IP Start",cvtTimeMS(&t->readStartTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld",cvtTimeMS(&t->readStartTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Read IP End",cvtTimeMS(&t->readEndTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld",cvtTimeMS(&t->readEndTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Deserialization Start",cvtTimeMS(&t->dserStartTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld",cvtTimeMS(&t->dserStartTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Deserialization End",cvtTimeMS(&t->dserEndTime)); 
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld",cvtTimeMS(&t->dserEndTime)); 
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "ACMS Start",cvtTimeMS(&t->acmsStartTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->acmsStartTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "ACMS End",cvtTimeMS(&t->acmsEndTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->acmsEndTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Serialization Start",cvtTimeMS(&t->serStartTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld",cvtTimeMS(&t->serStartTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Serialization End",cvtTimeMS(&t->serEndTime)); 
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld",cvtTimeMS(&t->serEndTime)); 
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Send IP Start",cvtTimeMS(&t->sndStartTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->sndStartTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Send IP End",cvtTimeMS(&t->sndEndTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->sndEndTime));
+
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Stat Start",cvtTimeMS(&t->statStartTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->statStartTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Stat End",cvtTimeMS(&t->statEndTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->statEndTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "POV Start",cvtTimeMS(&t->povStartTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->povStartTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "POV End",cvtTimeMS(&t->povEndTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->povEndTime));
+
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Trace Start",cvtTimeMS(&t->tracStartTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->tracStartTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Trace End",cvtTimeMS(&t->tracEndTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld", cvtTimeMS(&t->tracEndTime));
+
+   if (includeHeader)  
+     msgBuf->appendFormat(msgBuf, ",%s: %Ld", "Ended",cvtTimeMS(&t->endTime));
+   else
+     msgBuf->appendFormat(msgBuf, ", %Ld",cvtTimeMS(&t->endTime));
+
+//   printf("TimeStamps: %s\n", msgBuf->value);
+   PNILogTrace(TRACE_LEVEL_TIMESTAMP, "IPSERVER", "", operId, "REQUEST", "TIMESTAMPS", msgBuf->value);
+       
+   DestroyStringBuffer(&msgBuf);
+   
+}
+  
+//static void DoACMSPerformanceMonitoring( ACMSTaskT  task, VmsTime_T * beg, VmsTime_T * end, char *sts)
+//{
+//    if (!task) return;
+//    if (!ACMSPerformanceMonitoring) return;
+//   
+//    lib$establish(Gen_Etl_Err_SigToRet);
+
+//    ACMSPERF$LOG_ONE_TASK(task->dscr->name, beg, end, sts);
+  
+//}
+static int Ips_ConnectionHandler( RequestCtxT * requestCtx )
+{
+    int			      sts    =0, isValidSession = 0;
+    TcpHostName_T	remoteHost;
+    IPAddress_T   address;
+    char timBuf[24];
+    char msg[512];
+    
+    VmsTime_T fff;
+    ProcessingTimeStampsT * tStmp = &requestCtx->tStamps;
+    
+    tStmp->startTime = GetTime();
+    
+  //  char *        msg    = NULL;
+    IpsSessionControlT *   sessionCtrlWS;
+    SessionControlT session = NULL;
+    int           msgLen = 0;
+    char  *       msgout = NULL;
+    char * tmpID;
+    char * tmpAppl;
+    
+	char taskStatus[10];
+    int  taskStatusLen=0;
+    Boolean_T    keepAliveSupport = FALSE;
+    ACMSWorkspaceT * commonWs;
+    ACMSWorkspaceT * errorWs;
+    ACMSWorkspaceT * userProfileWs;
+    ACMSWorkspaceT * taskInfoWs;
+    ACMSWorkspaceDscrFieldPathT  * fld1;
+    ACMSWorkspaceDscrFieldPathT  * fld2;
+    ACMSWorkspaceDscrFieldPathT  * fld3;
+    ACMSWorkspaceDscrFieldPathT  * taskidfld;
+    UInteger_T * taskId          = nullTaskId ;
+    int stateSlot                = requestCtx->stateSlot;
+    Boolean_T  statisticsRequired = FALSE;
+    //Change made to avoid crash when there is no msg received by IPS
+    requestCtx->task = NULL;
+
+// TO do -- deserialization    
+
+    //lib$establish(Gen_Etl_Err_SigToRet);
+	lib$establish( Gen_Utl_Err_SigToResignal );
+ 
+    sts = Tcp_Utl_Hnd_Get_Peer_Host(requestCtx->workerSocket, &address, remoteHost);
+    UWord_T remotePort = address.port;
+    requestCtx->buffer = CreateStringBuffer(65535, 10000);
+    
+//    TRY
+//    {
+          
+       tStmp->readStartTime = GetTime();
+  
+       sts =  receiveMessage (requestCtx->workerSocket, requestCtx->buffer, &keepAliveSupport )    ;
+       tStmp->readEndTime = GetTime();
+      
+      if (requestCtx->buffer->length > 0)
+      {
+          //Step 1 - covert message to Task 
+          //Step 2 - on success exectute task
+          //Step 3 - create message for task
+         
+            printf("Thread %8.8d - %s - , Message received from %s:%d - read time %Ld\n",pthread_self(),vmsasctime(NULL),
+ 			remoteHost, remotePort, tStmp->readEndTime.UINT -  tStmp->readStartTime.UINT
+            
+            );      
+            if ( TraceXMLMessages)   printf("Thread %8.8d -,Message Received %s:%d ->\n%s\n\n", pthread_self(), remoteHost,remotePort , requestCtx->buffer->value);
+      
+            if (memcmp(requestCtx->buffer->value, "PING", 4) == 0)
+            {
+                memcpy(requestCtx->buffer->value, "OK ", 3);
+                writeMessage(requestCtx->workerSocket, requestCtx->buffer->value, requestCtx->buffer->length);
+                waitForClose (requestCtx->workerSocket )    ;  
+                 
+                goto ExitF; 
+            }          
+            requestCtx->task = NULL;     
+             tStmp->dserStartTime = GetTime();
+            sts = IpsReceiveACMSRequest(&requestCtx->task, requestCtx->buffer->value,   requestCtx->buffer->length);
+             tStmp->dserEndTime   = GetTime(); 
+            if (requestCtx->task != NULL)
+            {
+	        cvtCobolToTrimmedCStringNoalloc(requestCtx->task->header.operation_id, sizeof(requestCtx->task->header.operation_id));
+        //DS-added on 12/06/2014
+                cvtCobolToTrimmedCStringNoalloc(requestCtx->task->header.application, sizeof(requestCtx->task->header.application));
+        //DS-End
+
+	        // Susmitha changes on 12/Sep/2017
+                // Get the session details to write user id to the log
+		if(requestCtx->task->taskType == TASK_ACMS)
+		{
+		  commonWs = GetCommonPniTaskControl( requestCtx->task);
+                  errorWs = GetErrorWorkSpace( requestCtx->task);
+                  tmpID =  CVTCOBOLCSTRING(requestCtx->task->header.session_id);
+                  isValidSession = GetSession (& session, &address, remoteHost, tmpID);
+                  if (!isValidSession)
+                  {
+                        if (errorWs)
+                        {
+                           fld2 = GetACMSWorkpaceFieldPathDescr(commonWs->dscr, "CS_TASK_RETURN_CODE");
+                           ACMSWsSetDataString(commonWs, fld2, "FATAL", 5 );
+                           free(fld2);
+//dharani changed sprintf to snprintf and added sizeof(message)
+                           snprintf(message,sizeof(message), ERROR_SESSION_MESSAGE_FORMAT, ++fatalErrorSequence );
+
+			   fld2 = GetACMSWorkpaceFieldPathDescr(errorWs->dscr, "ERROR_MESSAGE_LINE[0]");
+                           ACMSWsSetDataString(errorWs, fld2, message, strlen(message));
+                           free(fld2);
+                           fld2 = GetACMSWorkpaceFieldPathDescr(errorWs->dscr, "LINE_COUNTER");
+                           ACMSWsSetDataString(errorWs, fld2, "1", 1 );
+                           free(fld2);
+                        }
+                   }
+//dharani changed sprintf to snprintf
+		   snprintf(msg,sizeof(msg), "Thread %8.8d - %s - %s, Messaged parsed - task received for user %s is %s",pthread_self(), vmsasctime(NULL),
+                        requestCtx->task->header.operation_id, session->acmsSignIn.userid, requestCtx->task->dscr->name);
+		}    
+	       else {
+//dharani changed sprintf to snprintf 			   
+                   snprintf(msg,sizeof(msg), "Thread %8.8d - %s - %s, Messaged parsed - task received is %s",pthread_self(), vmsasctime(NULL), 
+			requestCtx->task->header.operation_id, requestCtx->task->dscr->name);
+	       }
+               PutStateHandlerSlot(stateSlot, NULL, 0, msg); 
+               printf("%s\n", msg);         
+               
+               if (DumpTaskDebug) ACMSTaskDumpDebug(requestCtx->task, "Received");
+               //char * originator, char * correlation, char * event, char * step, char * data); 
+               memcpy(requestCtx->task->header.start_time,  formatOperationTime(NULL, timBuf, sizeof(timBuf)), sizeof(requestCtx->task->header.start_time));
+               PNILogTrace(TRACE_LEVEL_DATA, "IPSERVER", remoteHost, NULL, "TASKRECEIVE", "", requestCtx->task->dscr->name);     
+      
+               switch (requestCtx->task->taskType)
+               {
+                 case TASK_OTHER: break;
+                 case TASK_SESSION:  
+                   sessionCtrlWS = GetSessionCtrlPtr (requestCtx->task);
+                   if (memcmp(sessionCtrlWS->operation_id, "LOGOFF", 6) == 0)
+                   {
+                       tmpID = CVTCOBOLCSTRING(sessionCtrlWS->session_id);
+
+                       char msg[32];
+                       char userN[32];
+                       LogoutSession (&address, tmpID, userN) ; 
+                       free(tmpID);
+                       sessionCtrlWS->status = 1;
+
+                       strcpy(sessionCtrlWS->status_message, "Logged out");
+//dharani changed sprintf to snprintf and added sizeof(msg)
+                       snprintf(msg,sizeof(msg),"LOGOFF %s", userN );
+                       BroadcastIPSIntraComServer(environmentName, &environmentGroup, msg, strlen(msg), FALSE);  ;
+                   }
+                   else if (memcmp(sessionCtrlWS->operation_id, "LOGON", 5) == 0)
+                   {
+                      
+                      sts = LoginSession (&session, &address, remoteHost,  sessionCtrlWS);
+                      if (!sts)
+                      {
+                        sessionCtrlWS->status = 0;
+                        strcpy(sessionCtrlWS->status_message, "Error Logging in");
+                        
+                      }
+                      else
+                      {
+                           sessionCtrlWS->status = 1;
+                           strcpy(sessionCtrlWS->status_message, "Logged in");
+                      // Clean up session ion fa
+                   /*     ACMSTaskT prolog;
+                        
+                        tmpAppl =  CVTCOBOLCSTRING(requestCtx->task->header.application);
+                        sts = CreateACMSTask(tmpAppl, "CS_PRISM_TASK_PROLOG" , &prolog);  
+                        free(tmpAppl);
+                        sts = ExecuteAcmsTask(requestCtx->task, &session->acmsSignIn);
+                        if (EVEN(sts))
+                        {
+                          sprintf(location, "%s/Line:%d", __func__ , __LINE__ );
+                          sprintf(message, "ACMS CS_PRISM_TASK_PROLOG Error: %d", sts);
+                          PNILogError (SEVERITY_CRITICAL, "IPSERVER", False, __FILE__,  location   , "ACMS", message); 
+                          sessionCtrlWS->status = 0;
+                          strcpy(sessionCtrlWS->status_message, "Error Logging in");
+                        }
+                        else
+                        {
+                           sessionCtrlWS->status = 1;
+                           strcpy(sessionCtrlWS->status_message, "Logged in");
+                           ACMSWsCopy(GetUserProfileTaskControl(prolog),
+                               GetUserProfileTaskControl(requestCtx->task)); 
+                        } 
+                        
+                        DestroyACMSTask(&prolog); */        
+                        
+                      }
+                   }
+                   else
+                   {
+                       printf("Thread %8.8d - %s -%s, Invalid session operation id in session control: %s\n ", 
+                        pthread_self(), vmsasctime(NULL),
+                        requestCtx->task->header.operation_id,
+                        sessionCtrlWS->operation_id);
+                   }
+                   break;
+                 
+                 case TASK_ACMS:
+                    statisticsRequired = TRUE;
+                    // Susmitha changes on 12/Sep/2017
+		    // Commented below 3 lines as we are calling them above to write user id to log
+                    /*commonWs = GetCommonPniTaskControl( requestCtx->task);
+                    errorWs = GetErrorWorkSpace( requestCtx->task);
+                    tmpID =  CVTCOBOLCSTRING(requestCtx->task->header.session_id); */
+                
+                    strncpy(requestCtx->task->application, requestCtx->task->header.application, strcspn(requestCtx->task->header.application, " "));
+          
+                    userProfileWs = GetUserProfileTaskControl(requestCtx->task);
+                    if (DumpTaskDebug) ACMSWsDumpDebug(userProfileWs, " In User profile");
+                      
+		    //Susmitha changes on 12/Sep/2017
+		    //commented below changes as we are calling them above to write user id to log       
+                    /*sts = GetSession (& session, &address, remoteHost, tmpID);
+                    if (!sts)
+                    {
+                        if (errorWs)
+                        {
+                           fld2 = GetACMSWorkpaceFieldPathDescr(commonWs->dscr, "CS_TASK_RETURN_CODE");                     
+                           ACMSWsSetDataString(commonWs, fld2, "FATAL", 5 );
+                           free(fld2);
+//dharani changed sprintf to snprintf and added sizeof(message)
+                           snprintf(message,sizeof(message), ERROR_SESSION_MESSAGE_FORMAT, ++fatalErrorSequence );
+      
+                           fld2 = GetACMSWorkpaceFieldPathDescr(errorWs->dscr, "ERROR_MESSAGE_LINE[0]");                     
+                           ACMSWsSetDataString(errorWs, fld2, message, strlen(message));
+                           free(fld2); 
+                           fld2 = GetACMSWorkpaceFieldPathDescr(errorWs->dscr, "LINE_COUNTER");                     
+                           ACMSWsSetDataString(errorWs, fld2, "1", 1 );
+                           free(fld2); 
+                        }
+                    }
+                    else
+                    {*/
+                    //End of changes by Susmitha
+                    
+                    if(isValidSession)
+                    {
+//dharani changed sprintf to snprintf
+                      snprintf(msg,sizeof(msg),"Thread %8.8d - %s - %s, Executing task %s/%s for user - %s\n",pthread_self(), vmsasctime(NULL), 
+				   requestCtx->task->header.operation_id, requestCtx->task->dscr->name,
+				   tmpID, session->acmsSignIn.userid);
+                      PutStateHandlerSlot(stateSlot, NULL, 0, msg); 
+                      printf("%s\n", msg);         
+                       tStmp->acmsStartTime = GetTime();
+                       
+                      printf("Thread %8.8d - %s - %s, Sending task %s to ACMS for user %s from %s:%d /%s\n",pthread_self(), vmsasctime(NULL),
+                      		requestCtx->task->header.operation_id,
+                      		requestCtx->task->dscr->name, session->acmsSignIn.userid, remoteHost, remotePort , tmpID );
+                      AttachAcmsSession(session);
+                      // schedule a keep alive message to fool loadbalancer systems whcih disconnects after +/-3 minutes when no activity/traffic is detected 
+                      if (keepAliveSupport) scheduleKeepAliveMessage(requestCtx);
+                     // fff = GetTime();
+                      sts = ExecuteAcmsTask(requestCtx->task, GetAcmsSession( session) , requestCtx->stateSlot);
+                     // fff.INT = GetTime().UINT - fff.UINT;
+                     // printf("Task: %f\n", CnvToSecondsDbl(fff));
+//                      if (!strstr(task->dscr->name,"PROLOG")) Gen_Utl_WaitNoInterrupt(100.00);
+
+                       tStmp->acmsEndTime = GetTime();
+
+                      if (keepAliveSupport) cancelKeepAliveMessage(requestCtx);
+
+                      memset(taskStatus, '\0', sizeof(taskStatus) );
+                      fld2 = GetACMSWorkpaceFieldPathDescr(commonWs->dscr, "CS_TASK_RETURN_CODE");                     
+                      
+                      if (EVEN(sts))
+                      {
+                           ACMSWsSetDataString(commonWs, fld2, "FATAL", 5 );
+                            
+                           fld3 = GetACMSWorkpaceFieldPathDescr(errorWs->dscr, "ERROR_MESSAGE_LINE[0]");
+//dharani changed sprintf to snprintf and added sizeof(message)                     
+                           snprintf(message,sizeof(message), ERROR_MESSAGE_FORMAT, ++fatalErrorSequence ,sts);
+                           ACMSWsSetDataString(errorWs, fld3, message, strlen(message) );
+      
+                           free(fld3); 
+                           fld3 = GetACMSWorkpaceFieldPathDescr(errorWs->dscr, "LINE_COUNTER");                     
+                           ACMSWsSetDataString(errorWs, fld3, "1", 1 );
+                           free(fld3); 
+                           sprintf(location, "%s/Line:%d", __func__ , __LINE__ );
+                           sprintf(message, "ACMS Error: %d", sts);
+                          
+                           PNILogError (SEVERITY_CRITICAL, "IPSERVER", False, __FILE__,  location   , "ACMS", message, ""); 
+                      }
+                      
+                      ACMSWsGetDataString(commonWs, fld2,  taskStatus, sizeof(taskStatus)-1, &taskStatusLen );
+                      taskInfoWs = GetTaskInfoWorkSpace( requestCtx->task);
+                      taskId = (UInteger_T *) taskInfoWs->data;
+                      
+                      free(fld2);
+
+                      DetachAcmsSession(session);
+                       //tStmp->endTime       =  GetTime();
+//dharani changed sprintf to snprintf
+                                                                             
+   snprintf(msg,sizeof(msg),"Thread %8.8d - %s - %s, Completed task %s(%8.8x-%8.8x-%8.8x-%8.8x) for user %s from %s:%d in %dms\n",pthread_self(), 
+                                 vmsasctime(NULL),
+                           requestCtx->task->header.operation_id,
+                           requestCtx->task->dscr->name, 
+                           taskId[0],  taskId[1],  taskId[2],  taskId[3],
+                           session->acmsSignIn.userid,
+                           remoteHost,  remotePort ,
+                           difTimeMS(& tStmp->acmsStartTime, & tStmp->acmsEndTime)                    
+                      );
+                      PutStateHandlerSlot(stateSlot, NULL, 0, msg); 
+                      printf("%s\n", msg);         
+                    }
+                    free(tmpID);
+ 
+                    break;  
+               }
+            if (DumpTaskDebug) ACMSTaskDumpDebug(requestCtx->task, "\nReturned");
+            memcpy(requestCtx->task->header.end_time, formatOperationTime(NULL, timBuf, sizeof(timBuf)), sizeof(requestCtx->task->header.end_time));
+      
+            
+             tStmp->serStartTime = GetTime();
+            requestCtx->buffer->truncate(requestCtx->buffer, 0);
+            sts = IpsWriteACMSResponse(requestCtx->task, requestCtx->buffer);
+             tStmp->serEndTime   = GetTime();
+             
+            PutStateHandlerSlot(stateSlot, NULL, 0, "returning message to client "); 
+            
+             tStmp->sndStartTime = GetTime();
+            writeMessage (requestCtx->workerSocket, requestCtx->buffer->value, requestCtx->buffer->length );
+             tStmp->sndEndTime   = GetTime();
+             tStmp->endTime      =  GetTime();
+	    if(requestCtx->task->taskType == TASK_ACMS)
+//dharani changed sprintf to snprintf and added sizeof(msg)
+                 snprintf(msg,sizeof(msg), "Thread %8.8d - %s - %s, Returned task %s response to user %s at %s:%d after %dms from start",
+		      pthread_self(), vmsasctime(NULL),
+                      requestCtx->task->header.operation_id,
+                      requestCtx->task->dscr->name, session->acmsSignIn.userid, remoteHost, remotePort , 
+                      difTimeMS(& tStmp->startTime, & tStmp->endTime ));                         
+           
+            PutStateHandlerSlot(stateSlot, NULL, 0, msg);
+	    
+	    if(requestCtx->task->taskType == TASK_ACMS) 
+            {
+	       char tim[24];
+//dharani added sprintf to snprintf and added sizeof(msg)
+snprintf(msg,sizeof(msg), "Thread %8.8d - %s - %s, Processing time for task %s(%8.8x-%8.8x-%8.8x-%8.8x) for user %s is : %dms(Req to ACMS), %dms(Resp to GUI) started at %s\n",
+		      pthread_self(), vmsasctime(NULL),
+                      requestCtx->task->header.operation_id,
+                      requestCtx->task->dscr->name, 
+		      taskId[0],  taskId[1],  taskId[2],  taskId[3],
+		      session->acmsSignIn.userid,
+                      difTimeMS(& tStmp->startTime, & tStmp->acmsStartTime),
+		      difTimeMS(& tStmp->acmsEndTime, & tStmp->endTime),
+		      vmsasctime2(&tStmp->startTime,tim));    
+	
+               printf("%s\n", msg); 
+	       //End of changes by Susmitha to have processing time details in log
+            }
+             tStmp->tracStartTime = GetTime();
+           
+            PNILogTrace(TRACE_LEVEL_DATA, "IPSERVER", remoteHost, NULL, "TASKCOMPLETE", "", requestCtx->task->dscr->name);     
+            if ( TraceXMLMessages) printf("Thread %8.8d - Message Response:\n%s\n\n", pthread_self(), requestCtx->buffer->value);
+             tStmp->tracEndTime = GetTime();
+                                                   
+            PutStateHandlerSlot(stateSlot, NULL, 0, "reporting statistics"); 
+                                             
+             tStmp->statStartTime = GetTime();
+            if (statisticsRequired) PNILogStatistic ( currentNodeName, requestCtx->task->header.client_id, "ACMS",requestCtx->task->application , requestCtx->task->header.operation_id, requestCtx->task->dscr->name, & tStmp->startTime, & tStmp->endTime); 
+             tStmp->statEndTime  = GetTime();
+
+//            PutStateHandlerSlot(stateSlot, NULL, 0, "reporting POV"); 
+//             tStmp->povStartTime = GetTime();
+////            if (requestCtx->task->taskType  == TASK_ACMS) DoACMSPerformanceMonitoring(requestCtx->task, & tStmp->acmsStartTime, & tStmp->acmsEndTime, taskStatus);
+//             tStmp->povEndTime = GetTime();
+             tStmp->endTime = GetTime();
+
+            if (requestCtx->task->taskType  == TASK_ACMS)
+            {
+              DoTimeStampLog(taskId, requestCtx->task->dscr->name, requestCtx->task->header.operation_id, firstTimeStamp,  tStmp, remoteHost, remotePort);
+              firstTimeStamp = FALSE;
+            }
+//dharani changed sprintf to snprintf and added sizeof(msg)
+            snprintf(msg,sizeof(msg), "Thread %8.8d - %s - %s, Closing connection %s to %s:%d \n",pthread_self(), vmsasctime(NULL),
+                      requestCtx->task->header.operation_id,
+                      requestCtx->task->dscr->name, remoteHost, remotePort );                         
+ 
+            PutStateHandlerSlot(stateSlot, NULL, 0, msg); 
+
+            DestroyACMSTask(&requestCtx->task);          
+            waitForClose(requestCtx->workerSocket);
+
+
+            
+            //   printf("Ignore the folowing error on socket - wait for GUI to close connection\n");
+            //receiveMessage (requestCtx->workerSocket, requestCtx->buffer )    ;  
+            // printf("End of Ignore the folowing error on socket - to be fixed in GUI\n");
+           }
+            else
+            {
+                printf("Thread %8.8d - %s, Invalid task received : %s\n",pthread_self(), vmsasctime(NULL), requestCtx->buffer->value);
+            }
+        }
+  //    }
+  //    CATCH (pthread_stackovf_e)
+  //    {
+  //        //printf(vmsasctime(NULL), "Stack size overflow detected \n");
+	 // printf("%s, FATAL error -  Stack size overflow detected in thread %d - \
+	 //  	  adjust/augment the configuration parameter \"ExecutorThreadStackSize\" to \
+		//  increase the size of the stack\n", vmsasctime(NULL), pthread_self());
+  //        pthread_exc_report_np (THIS_CATCH);
+	 // sys$exit(2);
+  //    }
+  //    CATCH_ALL 
+  //    {
+  //       //printf( vmsasctime(NULL), " - Something else detected \n");
+	 //printf("%s, ERROR - Error detected in thread \
+		// %d\n",vmsasctime(NULL),pthread_self());
+	 //if (keepAliveSupport) cancelKeepAliveMessage(requestCtx);
+  //       pthread_exc_report_np (THIS_CATCH);
+
+  //    }
+  //    ENDTRY
+      
+ExitF:
+    if (requestCtx->buffer) DestroyStringBuffer(&requestCtx->buffer);
+    if (requestCtx->task) DestroyACMSTask(&requestCtx->task);   
+	requestCtx->buffer = NULL; 
+	requestCtx->task = NULL;
+    return 0;
+}
+
+/* Changes made to improve the logging while incrementing
+   or decrementing active threads*/
+static inline Integer_T incrementActiveThreads()
+{
+   Integer_T rV;
+   pthread_mutex_lock (&activeCounterMutex);
+   currentThreadsActive++;
+   rV = currentThreadsActive;
+   pthread_mutex_unlock (&activeCounterMutex);
+   return rV;
+}
+
+static inline Integer_T decrementActiveThreads()
+{
+   Integer_T rV;
+   pthread_mutex_lock (&activeCounterMutex);
+   if (currentThreadsActive > 0) currentThreadsActive--;
+   rV = currentThreadsActive;
+   pthread_mutex_unlock (&activeCounterMutex);
+   return rV;
+}
+
+static void * Ips_ConnectionHandler0( RequestCtxT * requestCtx )
+{
+    int sts;
+    Integer_T threadActive;
+    TRY
+    {
+		threadActive = incrementActiveThreads();
+
+
+		printf("Thread %8.8d - %s - ,Starting thread execution request - Current threads active %d\n",
+			pthread_self(),vmsasctime(NULL), threadActive);
+    
+	   
+		requestCtx->stateSlot = GetStateHandlerSlot( );
+		sts = Ips_ConnectionHandler(  requestCtx );
+    
+		threadActive = decrementActiveThreads();
+	}
+    CATCH (pthread_stackovf_e)
+    {
+          //printf(vmsasctime(NULL), "Stack size overflow detected \n");
+	  printf("%s, FATAL error -  Stack size overflow detected in thread %d - \
+	   	  adjust/augment the configuration parameter \"ExecutorThreadStackSize\" to \
+		  increase the size of the stack\n", vmsasctime(NULL), pthread_self());
+          pthread_exc_report_np (THIS_CATCH);
+	  sys$exit(2);
+    }
+    CATCH_ALL 
+    {
+ 	 printf("%s, ERROR - Error detected in thread %d\n",vmsasctime(NULL),pthread_self());
+	 cancelKeepAliveMessage(requestCtx);
+	 pthread_exc_report_np (THIS_CATCH);
+
+    }
+    ENDTRY
+
+	if (requestCtx->buffer) DestroyStringBuffer(&requestCtx->buffer);
+    if (requestCtx->task) DestroyACMSTask(&requestCtx->task);   
+	
+    Tcp_Utl_Hnd_Delete_Socket(&requestCtx->workerSocket, DISCARD_ALL_PACKAGES_ON_DELETE , FALSE);
+    
+    printf("Thread %8.8d - %s -,Terminate thread execution - Current threads active - %d\n", pthread_self(), vmsasctime(NULL), threadActive);
+    if (!RunAsRIDebugAgent)
+    {
+     sts = pthread_detach(requestCtx->workerThread);
+    }
+    if (requestCtx->serverSlot >= 0)
+    {
+      serverActiveEntries[requestCtx->serverSlot] = NULL;
+      FreeSlotPoolEntry(serverSlots, requestCtx->serverSlot);
+    }
+    ReleaseStateHandlerSlot( requestCtx->stateSlot );
+    
+    free(requestCtx);
+    return NULL;
+}
+
+
+static void ShowUsage(char * args[])
+{
+   printf("Usage %s [-v]  <configurationfile>", args[0]);
+   printf("    -v : verification mode \n");
+}
+
+
+
+
+static void closeTCPIPProperly()
+{
+    if (sockPassive)  
+    Tcp_Utl_Hnd_Delete_Socket (&sockPassive, DISCARD_ALL_PACKAGES_ON_DELETE , TRUE
+    );
+    sockPassive = NULL;
+}
+
+
+static Status_T ManageServer()
+{
+    
+    char evtName[255];
+    ManagerEventMessageT evtMess;
+    IPSEventType evtType;
+    
+    Gen_Utl_Get_Event    (managerEvent, True, evtName, (char *)& evtMess);
+
+    evtType = (IPSEventType) evtMess.event;
+    
+    //is for us ?
+    strcpy(evtName, "NONE");
+    switch (evtType)
+    {
+        case IPSEVENT_FORCE_PROCESS_DUMP:   
+            strcpy(evtName, "FORCE_PROCESS_DUMP");
+            break;
+        case IPSEVENT_STOP:   
+            strcpy(evtName, "STOP");
+            break;
+            
+        case IPSEVENT_STOPABORT:
+            strcpy(evtName, "STOPABORT");
+            break;
+        case IPSEVENT_RESTART:
+            strcpy(evtName, "RESTART");
+            break;
+ 
+        case IPSEVENT_RESTARTABORT :
+            strcpy(evtName, "RESTARTABORT");
+            break;
+        default:           
+           printf ("Invalid event received from manager !\n");
+           break;
+    }
+    
+    if(! Gen_Utl_Match_WildCard(serverId, strlen(serverId), evtMess.id, strlen(evtMess.id)))  
+    { 
+       printf("%s, Ignored EVENT received from manager  \"%s\" for node \"%s\"\n",  vmsasctime(NULL), evtName, evtMess.id);
+       return 1;
+    }
+    globalEvent  = evtType;
+    switch (evtType)
+    {
+        case IPSEVENT_FORCE_PROCESS_DUMP:   
+            lib$signal(SS$_IMGDMP);
+            break;
+        case IPSEVENT_STOP:   
+             StopLoadBalancerConnection();
+             delayCloseIPShutdown(  );
+            break;
+            
+        case IPSEVENT_STOPABORT:
+            StopLoadBalancerConnection();
+            closeTCPIPProperly();
+            break;
+        case IPSEVENT_RESTART:
+            StopLoadBalancerConnection();
+            delayCloseIPShutdown(  );
+            break;
+ 
+        case IPSEVENT_RESTARTABORT :
+             StopLoadBalancerConnection();
+             closeTCPIPProperly();
+            break;
+     
+    }
+    printf("%s, EVENT received from manager  \"%s\" for node \"%s\"\n",  vmsasctime(NULL), evtName, evtMess.id);
+    return 1;
+}
+
+static Status_T ManageSpecificServer()
+{
+    
+    char evtName[255];
+    ManagerEventMessageT evtMess;
+    IPSEventType evtType;
+    
+    Gen_Utl_Get_Event    (managerSpecificEvent, True, evtName, (char *)& evtMess);
+    
+
+    evtType = (IPSEventType) evtMess.event;
+    
+    //is for us ?
+    strcpy(evtName, "NONE");
+    switch (evtType)
+    {
+        case IPSEVENT_FORCE_PROCESS_DUMP:   
+            strcpy(evtName, "FORCE_PROCESS_DUMP");
+            break;
+        case IPSEVENT_STOP:   
+            strcpy(evtName, "STOP");
+            break;
+            
+        case IPSEVENT_STOPABORT:
+            strcpy(evtName, "STOPABORT");
+            break;
+        case IPSEVENT_RESTART:
+            strcpy(evtName, "RESTART");
+            break;
+ 
+        case IPSEVENT_RESTARTABORT :
+            strcpy(evtName, "RESTARTABORT");
+            break;
+        default:           
+           printf ("Invalid event received from manager !\n");
+           break;
+    }
+    
+    globalEvent  = evtType;
+    switch (evtType)
+    {
+        case IPSEVENT_FORCE_PROCESS_DUMP:   
+            lib$signal(SS$_IMGDMP);
+            break;
+        case IPSEVENT_STOP:   
+             StopLoadBalancerConnection();
+             delayCloseIPShutdown(  );
+            break;
+            
+        case IPSEVENT_STOPABORT:
+            StopLoadBalancerConnection();
+            closeTCPIPProperly();
+            break;
+        case IPSEVENT_RESTART:
+            StopLoadBalancerConnection();
+            delayCloseIPShutdown(  );
+            break;
+ 
+        case IPSEVENT_RESTARTABORT :
+             StopLoadBalancerConnection();
+             closeTCPIPProperly();
+            break;
+     
+    }
+    printf("%s, EVENT received from manager  \"%s\" for node \"%s\"\n",  vmsasctime(NULL), evtName, evtMess.id);
+    return 1;
+}
+static Status_T SetTracing()
+{
+    char evtName[255];
+    char evtPar[255];
+    Gen_Utl_Get_Event    ( traceEvent, TRUE, evtName, evtPar);
+    char * tmp0;
+    char * tmp1;
+    tmp0 = strtok(evtPar, ",");
+    tmp1 = strtok(NULL, ","); 
+//TODO - get the tracelevel of the second parameter and the TraceLeve
+    if ((strcmp(evtPar, "*") == 0) || (strcmp(tmp0, currentNodeName) == 0))
+    {
+        printf("%s, EVENT received from manager  \"%s\" for node \"%s\"\n",  vmsasctime(NULL), evtName, evtPar);
+    }
+    else
+        printf("%s, EVENT ignored from manager  \"%s\" for node \"%s\"  current node \"%s\"\n",  vmsasctime(NULL), evtName, evtPar, currentNodeName);
+   
+    return 1;
+}
+
+
+
+#define ErrChkBoss(x, y) \
+//TODO	if (x != 0) {  Poc_IP_Log_Error ("MAIN", "", __LINE__, __FILE__, x, vaxc$errno, 1, y); goto ExitF;}
+
+static void RunAccepts()
+{
+    TcpSocket_T         SockActive           = NULL;
+    RequestCtxT       * requestCtx;
+    static char			    hostname[256];
+    int sts;
+    int ErrorNbr;
+    volatile int ThreadNbr;
+   int         acceptErrors = 0;
+
+ 
+    Int64  totTime = 0;
+    VmsTime_T bT;
+    VmsTime_T eT;
+    int tCnt = 0; 
+    do
+    {
+        sts = Tcp_Utl_Hnd_Accept_Socket  (sockPassive, &SockActive);
+
+        bT = GetTime();
+        tCnt ++;
+        if( globalEvent  != IPSEVENT_NONE) break;
+        if (sts == 0)
+        {
+            ErrChkBoss(sts, "accept");
+            if (currentThreadsActive >  0)
+            {
+               printf("%s, Current Threads active: %d\n", vmsasctime(NULL), currentThreadsActive );
+               
+               // TO DO stop load balancer untill slots are free 
+               
+            }
+
+            waitForCompletion(ExecutorThreadsMaxActive - 1, -1);
+	    // Change made to avoid crash when there is no msg received
+            //was: requestCtx = malloc(sizeof(RequestCtxT));
+	    requestCtx = calloc(1, sizeof(RequestCtxT));
+            if (! requestCtx )   sys$exit(NOT_ENOUGH_MEMORY);
+            requestCtx->workerSocket = SockActive;
+            Gen_Utl_Str_Get_Unique_String  ("THREAD", "",requestCtx->ThreadId , 49);
+    
+            if (RunAsRIDebugAgent )
+               Ips_ConnectionHandler0( requestCtx);
+            else
+            {
+                sts   = pthread_create (&requestCtx->workerThread , 
+                       &stackAttr,	
+                       ( VoidFunction_T ) Ips_ConnectionHandler0,
+                        (void * ) requestCtx);
+    
+                 ErrChkBoss(sts, "Thread Creation");
+            }
+            acceptErrors = 0;
+        }
+        else
+        {
+            printf("%s, Error accepting socket - will abort after 5 errors - error cnt %d\n", vmsasctime(NULL),   ++ acceptErrors );
+            if (acceptErrors > 5) 
+            {
+               globalEvent =  IPSEVENT_RESTART;
+               printf("%s, Error accepting socket - will abort and restart\n", vmsasctime(NULL));
+            }
+        }
+        eT = GetTime();
+ //       totTime += (eT.UINT - bT.UINT);
+ //       if (tCnt % 100) printf("Total time for %d trans: %Ld\n",tCnt, totTime );
+    } while (1);
+
+
+}
+#undef  ErrChkBoss
+
+NIPSP_SERVER (int argc , char * args[]  ) MAIN_PROGRAM
+{
+ 
+    TcpSocket_T         SockActive           = NULL;
+    RequestCtxT       * requestCtx;
+    Boolean_T           verifyConfiguration = False;
+    Boolean_T           configSet = False;
+    
+    FileName_T  configPath;
+    FileName_T  defaultConfigPath;
+    int         acceptErrors = 0;
+    char specificEvent[512];
+
+    
+    MainExecutablePath = strdup(args[0]);
+    MainExecutablePath[strcspn(MainExecutablePath, ";")] = '\0';
+
+    Gen_Utl_Parse_VmsFileName(defaultConfigPath, "IPSERVER.CONF", MainExecutablePath, False);
+
+    strcpy(configPath,  defaultConfigPath);
+    if (argc < 2) 
+    {
+        ShowUsage(args);
+        exit (2);
+    }
+    for (int i=1; i < argc; i++)
+    {
+        if (args[i][0] == '-')
+        {
+            if (strcmp(args[i], "-v") == 0)  verifyConfiguration = True;
+        }
+        else
+        {
+           if (  configSet )
+           {
+              printf("Too many parameters\n\n");
+              ShowUsage(args);
+              exit (2);
+           }
+           configSet  = True;
+           strcpy(configPath, args[i]);
+        }
+    }     
+
+    if (! LoadIPSServerConfiguration(configPath))
+    {
+          printf("No configuration file found -  \"%s\" is missing \n", configPath);
+          exit(2);  
+    }
+    PrintConfiguration(NULL);
+    
+    if (RunAsRIDebugAgent )
+    { 
+  //     ACMSPerformanceMonitoring = FALSE;
+ //      LgrErrorForwardCockpitFallback = FALSE;
+      // LgrErrorForwardCockpit = FALSE;
+        printf("Running server for in RI ACMS DEBUG mode \n");
+    }
+    SetSessionExpiryParams( SessionControlExpiryTime , SessionControlExpiryCheckInterval) ;  
+
+    Gen_Utl_Declare_ExitHandler(closeTCPIPProperly,NULL);
+    Gen_Utl_Get_SystemName(currentNodeName);
+    InitializeClientLogger();
+
+    LoadDataHandler();
+    InitializeAcmsAgent(asynchronuousAcmsAgent);
+    InitializeSessionControl();
+    InitializeServer();
+    sprintf(specificEvent, "%s_%s_%s", MANAGER_EVENT, environmentName, currentNodeName) ;
+    
+ //   InitACMSPerformanceMonitoring();
+
+    Gen_Utl_Declare_Event("TRACE",           SetTracing, &traceEvent);
+    Gen_Utl_Declare_Event(MANAGER_EVENT,      ManageServer, &managerEvent);
+    Gen_Utl_Declare_Event(specificEvent,      ManageSpecificServer, &managerSpecificEvent);
+
+    Gen_Utl_Listen_Event(managerEvent);
+    Gen_Utl_Listen_Event(managerSpecificEvent);
+    Gen_Utl_Listen_Event(traceEvent);
+ 
+    sprintf(serverId,  "%s_%s",  currentNodeName,  environmentName);
+    char lockName[32];
+    
+    sprintf(lockName, "IPS$INS_%s_%d", currentNodeName, TcpServerPort);
+    if (!tcpipSharePort)
+    {
+      printf("%s, Waiting for IPServer port %d in exclusive mode \n",  vmsasctime(NULL), TcpServerPort );
+      Gen_Utl_Get_VmsLock(lockName, True, &serverLock, EXCLUSIVE_LOCK) ;
+    }
+    else
+    {
+//      printf("%s, Waiting for IPServer port %d in concurrent mode \n",  vmsasctime(NULL), TcpServerPort );
+      Gen_Utl_Get_VmsLock(lockName, True, &serverLock, CONCURRENT_WRITE_LOCK) ;
+    }
+    
+    static char			    hostname[256];
+    int sts;
+    int ErrorNbr;
+    volatile int ThreadNbr;
+
+    Tcp_Utl_Ini_Access();
+    int retryCnt = 0;
+retry:
+    sts = Tcp_Utl_Hnd_Create_ListenSocket	(&sockPassive, TcpServerPort, tcpipSharePort, 20);
+    if (sts != 0)
+    {
+        sts = sockPassive->SockLastSysStatus;
+        sockPassive = NULL;
+        printf("Creation of listen socket on port %d failed with status %d  \n", TcpServerPort, sts );
+        if (sts == 0x94)
+        {
+             printf ("status 0x94 (148) --> The port is still in use \n");
+             if (retryCnt++ < TcpCreateListenSocketMaxRetries)
+             { 
+                printf("Retrying %d after %d seconds ... \n", retryCnt, TcpCreateListenSocketRetryWaitInterval);
+                Gen_Utl_Wait(TcpCreateListenSocketRetryWaitInterval);
+                goto retry;
+            }   
+        }
+        exit(sts);
+    }
+    printf("%s, IPServer  is running on port %d\n", vmsasctime(NULL), TcpServerPort );
+
+    if (PingServerPort >= 0) StartLoadBalancerConnection();
+ 
+    InitIPSIntraComServer(intraCommHandlerhandler,  environmentName);
+    if (FALSE)   // disabled - run the main thread as a separate thread
+    {   
+       sts   = pthread_create (&handlerThread ,  &stackHandlerAttr,	 ( VoidFunction_T ) RunAccepts,  NULL);
+       pthread_join(handlerThread, NULL);
+       
+    }
+    else
+    {
+        pthread_t		    DbThread;
+        Int64  totTime = 0;
+        VmsTime_T bT;
+        VmsTime_T eT;
+        int tCnt = 0; 
+        do
+        {
+            sts = Tcp_Utl_Hnd_Accept_Socket  (sockPassive, &SockActive);
+            bT = GetTime();
+            tCnt ++;
+            if( globalEvent  != IPSEVENT_NONE) break;
+            if (sts == 0)
+            {
+                if (TcpipSocketNoDelay) Tcp_Utl_Set_Option_Socket(SockActive,  "NODELAY",  1);
+                if (currentThreadsActive >  0)
+                {
+                   printf("%s, Current Threads active: %d - free %d\n", vmsasctime(NULL), currentThreadsActive ,
+                       ExecutorThreadsMaxActive - currentThreadsActive
+                    );                                      
+                }
+                //
+                if ((currentThreadsActive + 1) >= ExecutorThreadsMaxActive)
+                {
+             
+                     printf("%s, Maximum Current Threads active - waiting for free slot : %d\n", vmsasctime(NULL), currentThreadsActive );                                      
+                     waitForCompletion(ExecutorThreadsMaxActive - 1, -1);
+                 // dd 
+                }
+		//Change made to avoid crash when there is no msg received
+                //was: requestCtx = malloc(sizeof(RequestCtxT));
+		requestCtx = calloc(1, sizeof(RequestCtxT));
+                if (! requestCtx )   sys$exit(NOT_ENOUGH_MEMORY);
+                requestCtx->tStamps.acceptTime = bT;
+                requestCtx->workerSocket = SockActive;
+                requestCtx->serverSlot = GetSlotPoolEntry(serverSlots);
+                if ( requestCtx->serverSlot >= 0)
+                serverActiveEntries[requestCtx->serverSlot] = requestCtx;
+                
+      
+                Gen_Utl_Str_Get_Unique_String  ("THREAD", "",requestCtx->ThreadId , 49);
+        
+                if (RunAsRIDebugAgent )
+                   Ips_ConnectionHandler0( requestCtx);
+                else
+                {
+                    sts   = pthread_create (&requestCtx->workerThread , 
+                           &stackAttr,	
+                           ( VoidFunction_T ) Ips_ConnectionHandler0,
+                            (void * ) requestCtx);
+        
+                    if (sts != 0)
+                    {
+                      printf("%s, Cannot create thread - status %d (%d) - Thread active: %d\n",  vmsasctime(NULL),sts, vaxc$errno, currentThreadsActive );
+                      if ( requestCtx->serverSlot >= 0 )
+			serverActiveEntries[requestCtx->serverSlot] = NULL;
+		    }  
+                }
+                acceptErrors = 0;
+            }
+            else
+            {
+                printf("%s, Error accepting socket - will abort after 5 errors - error cnt %d\n", vmsasctime(NULL),   ++ acceptErrors );
+                if (acceptErrors > 5) 
+                {
+                   globalEvent =  IPSEVENT_RESTART;
+                   printf("%s, Error accepting socket - will abort and restart\n", vmsasctime(NULL));
+                }
+            }
+            eT = GetTime();
+     //       totTime += (eT.UINT - bT.UINT);
+     //       if (tCnt % 100) printf("Total time for %d trans: %Ld\n",tCnt, totTime );
+        } while (1);
+     }
+ExitF:
+     StopLoadBalancerConnection();
+     closeTCPIPProperly();
+     Gen_Utl_Release_VmsLock(serverLock) ;
+
+#undef ErrChkBoss
+        char prcN[255];
+    switch (globalEvent)
+    {
+        case IPSEVENT_STOP:   
+             //TO DO handle w
+            if (maximumWaitTimeThreadCompletionOnExit > 0)
+               printf("Exiting program - waiting %d seconds to complete !\n ", maximumWaitTimeThreadCompletionOnExit);
+            else        
+               printf("Exiting program - waiting  to complete all executing tasks !\n ");
+            
+            StopIccMessageProcessing();
+            waitForCompletion(0, maximumWaitTimeThreadCompletionOnExit);
+            sys$exit(3);
+            break;
+            
+            
+        case IPSEVENT_STOPABORT:
+          
+            sys$exit(SS$_ABORT);
+            
+            break;
+        case IPSEVENT_RESTART:
+        // rename the process
+        // start the new server
+            StopIccMessageProcessing();
+
+            if (maximumWaitTimeThreadCompletionOnExit > 0)
+              printf("Exiting program - waiting %d seconds to complete all executing tasks!\n ", maximumWaitTimeThreadCompletionOnExit);
+            else        
+              printf("Exiting program - waiting  to complete all executing tasks !\n ");
+            char command [1024];
+//            sprintf(command, restartCommandFormat, environmentName);
+//            sts = Gen_Exe_Dcl_Commands(command, NULL);
+
+            waitForCompletion(0, maximumWaitTimeThreadCompletionOnExit);
+            strcpy(prcN, Gen_Utl_Get_ProcessName());
+            prcN[1] = '_';
+            Gen_Utl_Set_Process_Name(prcN);
+ 
+            sys$exit(5);// change  5 
+            break;
+ 
+        case IPSEVENT_RESTARTABORT :
+              sys$exit(5);
+              break;
+        default:
+           break;
+    }
+    sys$exit (1);
+}
